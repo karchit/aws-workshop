@@ -1,41 +1,208 @@
-# Module 3 - Adding a Data Tier with Amazon DynamoDB
+# Module 4: Adding User and API features with Amazon API Gateway and AWS Cognito
 
-![Architecture](/images/module-3/architecture-module-3.png)
+![Architecture](/images/module-4/architecture-module-4.png)
 
-**Time to complete:** 20 minutes
+**Time to complete:** 60 minutes
 
 ---
-**Short of time?:** If you are short of time, refer to the completed reference AWS CDK code in `module-3/cdk`
+**Short of time?:** If you are short of time, refer to the completed reference AWS CDK code in `module-4/cdk`
 
 ---
 
 **Services used:**
-* [Amazon DynamoDB](https://aws.amazon.com/dynamodb/)
 
-### Overview
+* [Amazon Cognito](http://aws.amazon.com/cognito/)
+* [Amazon API Gateway](https://aws.amazon.com/api-gateway/)
+* [Amazon Simple Storage Service (S3)](https://aws.amazon.com/s3/)
 
-Now that you have a service deployed and a working CI/CD pipeline to deliver changes to that service automatically whenever you update your code repository, you can quickly move new application features from conception to available for your Mythical Mysfits customers.  With this increased agility, let's add another foundational piece of functionality to the Mythical Mysfits website architecture, a data tier.  In this module you will create a table in [Amazon DynamoDB](https://aws.amazon.com/dynamodb/), a managed and scalable NoSQL database service on AWS with super fast performance.  Rather than have all of the Mysfits be stored in a static JSON file, we will store them in a database to make the websites future more extensible and scalable.
+## Overview
 
-### Adding a NoSQL Database to Mythical Mysfits
+In order to add some more critical aspects to the Mythical Mysfits website, like allowing users to vote for their favorite Mysfit and adopt a Mysfit, we need to first have users register on the website.  To enable registration and authentication of website users, we will create a [**User Pool**](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-identity-pools.html) in [**AWS Cognito**](http://aws.amazon.com/cognito/), a fully managed user identity management service.
 
-#### Create a DynamoDB Table
+We want to restrict liking and adopting Mysfits to registered users, so we'll need to restrict access to those paths in our Flask web app running on Fargate. Our Fargate service is currently using a Network Load Balancer (NLB), which doesn't support validating request authorization headers. To achieve this we have a few options: we can switch to an [Application Load Balancer](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html), we can have our Flask web app validate our authorization headers, or we can use [Amazon API Gateway](https://aws.amazon.com/api-gateway/).
 
-To add a DynamoDB table to the architecture, we will write another CloudFormation stack using AWS CDK that defines a table called **MysfitsTable**. This table will have a primary index defined by a hash key attribute called **MysfitId**, and two more secondary indexes.  The first secondary index will have the hash key of **GoodEvil** and a range key of **MysfitId**, and the other secondary index will have the hash key of **LawChaos** and a range key of **MysfitId**.  These two secondary indexes will allow us to execute queries against the table to retrieve all of the mysfits that match a given Species or Alignment to enable the filter functionality.
+Amazon API Gateway provides commonly required REST API capabilities out of the box like SSL termination, CORS, request authorization, throttling, API stages and versioning, and much more. For these reasons, we'll choose to deploy an API Gateway in front of our NLB.
 
-Create a new file in the `lib` folder called `dynamodb-stack.ts`.
+Our API Gateway will provide HTTPS and CORS support, and also request authorization validation by integrating with our Cognito User Pool. We'll restrict access to authenicated users only on the `/adopt` and `/like` API endpoints
+
+API Gateway will then pass traffic through to our NLB to be processed by our Flask web app running on Fargate.
+
+### Adding a User Pool for Website Users
+
+#### Create the Cognito User Pool
+
+To create the **Cognito User Pool** where all of the Mythical Mysfits visitors will be stored, create a new TypeScript file which we will use to define the Cognito stack.
 
 ```sh
 cd ~/environment/workshop/cdk
-touch lib/dynamodb-stack.ts
+touch lib/cognito-stack.ts
 ```
 
-Within the file you just created, define the skeleton CDK Stack structure as we have done before, this time naming the class  `DynamoDbStack`:
+Open the file `cognito-stack.ts` and define the following stack template:
+
+```typescript
+import cdk = require("@aws-cdk/core");
+
+export class CognitoStack extends cdk.Stack {
+
+  constructor(scope: cdk.Construct, id: string) {
+    super(scope, id);
+
+  }
+}
+```
+
+As we have done previously, we need to install the CDK NPM package for AWS Cognito:
+
+```sh
+npm install --save-dev @aws-cdk/aws-cognito
+```
+
+At the top of the file, add the import statement for the AWS Cognito cdk library
+
+```typescript
+import cognito = require("@aws-cdk/aws-cognito");
+```
+
+Just before the constructor statement, define the following public properties
+
+```typescript
+public readonly userPool: cognito.UserPool;
+public readonly userPoolClient: cognito.UserPoolClient;
+```
+
+Now, within the constructor _(after the `super(scope, id);` statement)_, define the Amazon Cognito UserPool
+
+```typescript
+this.userPool = new cognito.UserPool(this, 'UserPool', {
+  userPoolName: 'MysfitsUserPool',
+  autoVerifiedAttributes: [
+    cognito.UserPoolAttribute.EMAIL
+  ]
+});
+```
+
+This will create a Cognito UserPool and defines that all users who are registered with this pool should automatically have their email address verified via confirmation email before they become confirmed users.
+
+The last set we have to perform is to define a Amazon Cognito User Pool Client, which our web application will use.
+
+Again, within the constructor _(after the super(scope, id); statement)_, define the Amazon Cognito UserPool Client
+
+```typescript
+this.userPoolClient = new cognito.UserPoolClient(this, 'UserPoolClient', {
+  userPool: this.userPool,
+  userPoolClientName: 'MysfitsUserPoolClient'
+});
+```
+We can have the generated CloudFormation template provide the Cognito User Pool ID and the Cognito User Pool Client ID by defining custom output properties defining `cdk.CfnOutput` constructs. Declare `cdk.CfnOutput` both for the Cognito User Pool ID and the Cognito User Pool Client ID.
+
+```typescript
+new cdk.CfnOutput(this, "CognitoUserPool", {
+  description: "The Cognito User Pool",
+  value: this.userPool.userPoolId
+});
+
+new cdk.CfnOutput(this, "CognitoUserPoolClient", {
+  description: "The Cognito User Pool Client",
+  value: this.userPoolClient.userPoolClientId
+});
+```
+
+With that done, your `cognito_stack.ts` file should resemble the following.
+
+```typescript
+import cdk = require("@aws-cdk/core");
+import cognito = require("@aws-cdk/aws-cognito");
+
+export class CognitoStack extends cdk.Stack {
+  public readonly userPool: cognito.UserPool;
+  public readonly userPoolClient: cognito.UserPoolClient;
+
+  constructor(scope: cdk.Construct, id: string) {
+    super(scope, id);
+
+    this.userPool = new cognito.UserPool(this, 'UserPool', {
+      userPoolName: 'MysfitsUserPool',
+      autoVerifiedAttributes: [
+        cognito.UserPoolAttribute.EMAIL
+      ]
+    });
+
+    this.userPoolClient = new cognito.UserPoolClient(this, 'UserPoolClient', {
+      userPool: this.userPool,
+      userPoolClientName: 'MysfitsUserPoolClient'
+    });
+
+    new cdk.CfnOutput(this, "CognitoUserPool", {
+      description: "The Cognito User Pool",
+      value: this.userPool.userPoolId
+    });
+
+    new cdk.CfnOutput(this, "CognitoUserPoolClient", {
+      description: "The Cognito User Pool Client",
+      value: this.userPoolClient.userPoolClientId
+    });
+  }
+}
+```
+
+OK, That is our Amazon Cognito resources defined.  Now, let's add this to our `cdk.ts` bootstrap file.
+
+Import your new `CognitoStack` definition into the `cdk.ts` file by inserting the following `import` statement at the top of the file
+
+```typescript
+import { CognitoStack } from '../lib/cognito-stack';
+```
+
+Insert the following definition at the end your `cdk.ts` file.
+
+```typescript
+const cognito = new CognitoStack(app,  "MythicalMysfits-Cognito");
+```
+
+With that done, now we want to deploy the Cognito resources.  Make sure your CDK application compiles without error and deploy your application to your AWS account.
+
+```sh
+npm run build
+cdk deploy MythicalMysfits-Cognito
+```
+
+From the output of the previous command, note down the Cognito User Pool ID and the Cognito User Pool Client ID as we'll need these at a later step.
+
+### Adding a new REST API with Amazon API Gateway
+
+### Create an API Gateway VPC Link
+
+Next, let's turn our attention to creating a new RESTful API in front of our existing Flask service, so that we can perform request authorization before our NLB receives any requests.  We will do this with **Amazon API Gateway**, as described in the module overview.  In order for API Gateway to privately integrate with our NLB, we will configure an **API Gateway VPCLink** that enables API Gateway APIs to directly integrate with backend web services that are privately hosted inside a VPC.
+
+> **Note:** For the purposes of this workshop, we created the NLB to be *internet-facing* so that it could be called directly in earlier modules. Because of this, even though we will be requiring Authorization tokens in our API after this module, our NLB will still actually be open to the public behind the API Gateway API.  In a real-world scenario, you should create your NLB to be *internal* from the beginning (or create a new internal load balancer to replace the existing one), knowing that API Gateway would be your strategy for Internet-facing API authorization. But for the sake of time, we'll use the NLB that we've already created that will stay publicly accessible.
+
+#### Create the REST API using Swagger
+
+Your MythicalMysfits REST API is defined using **Swagger**, a popular open-source framework for describing APIs via JSON.  This Swagger definition of the API is located at `workshop/source/module-4/api/api-swagger.json`.  Open this file and you'll see the REST API and all of its resources, methods, and configuration defined within.
+
+The `securityDefinitions` object within the API definition indicates that we have setup an apiKey authorization mechanism using the Authorization header.  You will notice that AWS has provided custom extensions to Swagger using the prefix `x-amazon-api-gateway-`, these extensions are where API Gateway specific functionality can be added to typical Swagger files to take advantage of API Gateway-specific capabilities.
+
+To create the VPCLink and the API Gateway using the AWS CDK, create a new file in the `workshop/cdk/lib` folder called `apigateway-stack.ts`.
+
+```sh
+cd ~/environment/workshop/cdk
+touch lib/apigateway-stack.ts
+```
+
+Within the file you just created, define the skeleton CDK Stack structure as we have done before, this time naming the class `APIGatewayStack`:
 
 ```typescript
 import cdk = require('@aws-cdk/core');
 
-export class DynamoDbStack extends cdk.Stack {
-  constructor(scope: cdk.Construct, id:string) {
+interface APIGatewayStackProps extends cdk.StackProps {
+  loadBalancerDnsName: string;
+  loadBalancerArn: string;
+  userPoolId: string;
+}
+
+export class APIGatewayStack extends cdk.Stack {
+  constructor(scope: cdk.Construct, id:string, props: APIGatewayStackProps) {
     super(scope, id);
 
     // The code that defines your stack goes here
@@ -43,7 +210,7 @@ export class DynamoDbStack extends cdk.Stack {
 }
 ```
 
-Then, add the DynamoDbStack to our CDK application definition in `bin/cdk.ts`, when done, your `bin/cdk.ts` should look like this:
+Then, add the APIGatewayStack to our CDK application definition in `bin/cdk.ts`, when done, your `bin/cdk.ts` should look like this;
 
 ```typescript
 #!/usr/bin/env node
@@ -56,6 +223,8 @@ import { EcrStack } from "../lib/ecr-stack";
 import { EcsStack } from "../lib/ecs-stack";
 import { CiCdStack } from "../lib/cicd-stack";
 import { DynamoDbStack } from '../lib/dynamodb-stack';
+import { CognitoStack } from '../lib/cognito-stack';
+import { APIGatewayStack } from "../lib/apigateway-stack";
 
 const app = new cdk.App();
 new WebApplicationStack(app, "MythicalMysfits-Website");
@@ -73,220 +242,168 @@ const dynamoDbStack = new DynamoDbStack(app, "MythicalMysfits-DynamoDB", {
     vpc: networkStack.vpc,
     fargateService: ecsStack.ecsService.service
 });
+const cognito = new CognitoStack(app,  "MythicalMysfits-Cognito");
+new APIGatewayStack(app, "MythicalMysfits-APIGateway", {
+  userPoolId: cognito.userPool.userPoolId,
+  loadBalancerArn: ecsStack.ecsService.loadBalancer.loadBalancerArn,
+  loadBalancerDnsName: ecsStack.ecsService.loadBalancer.loadBalancerDnsName
+});
 ```
 
-As we have done previously, we need to install the CDK NPM package for AWS DynamoDB:
+Install the AWS CDK npm package for API Gateway by executing the following command from within the `workshop/cdk/` directory:
 
 ```sh
-npm install --save-dev @aws-cdk/aws-dynamodb
+npm install --save-dev @aws-cdk/aws-apigateway
 ```
 
-Within the `dynamodb-stack.ts` file, import the required modules:
+Back in `APIGatewayStack.ts`, define the class imports for the code we will be writing:
 
 ```typescript
-import cdk = require("@aws-cdk/core");
-import dynamodb = require("@aws-cdk/aws-dynamodb");
-import iam = require("@aws-cdk/aws-iam");
-import ec2 = require("@aws-cdk/aws-ec2");
-import ecs = require("@aws-cdk/aws-ecs");
+import cdk = require('@aws-cdk/core');
+import apigateway = require('@aws-cdk/aws-apigateway');
+import elbv2 = require('@aws-cdk/aws-elasticloadbalancingv2');
+import fs = require('fs');
+import path = require('path');
 ```
 
-Then define the following properties interface to define what constructs this stack depends upon:
+Now, within the constructor of our `APIGatewayStack` class, let's import the Network Load Balancer from the ECS Cluster created in Module 2:
 
 ```typescript
-interface DynamoDbStackProps extends cdk.StackProps {
-  vpc: ec2.Vpc;
-  fargateService: ecs.FargateService;
-}
-```
-
-Now change the constructor of your DBStack to require your properties object.
-
-```typescript
-  constructor(scope: cdk.Construct, id: string, props: DynamoDbStackProps) {
-```
-
-Next, we want to define a VPC endpoint to allow a secure path for traffic to travel between our VPC and the DynamoDB database:
-
-```typescript
-const dynamoDbEndpoint = props.vpc.addGatewayEndpoint("DynamoDbEndpoint", {
-  service: ec2.GatewayVpcEndpointAwsService.DYNAMODB,
-  subnets: [{
-      subnetType: ec2.SubnetType.PRIVATE
-  }]
+const nlb = elbv2.NetworkLoadBalancer.fromNetworkLoadBalancerAttributes(this, 'NLB', {
+  loadBalancerArn: props.loadBalancerArn,
 });
-
-const dynamoDbPolicy = new iam.PolicyStatement();
-dynamoDbPolicy.addAnyPrincipal();
-dynamoDbPolicy.addActions("*");
-dynamoDbPolicy.addAllResources();
-
-dynamoDbEndpoint.addToPolicy(
-  dynamoDbPolicy
-);
 ```
 
-Next, we need to define the DynamoDB table; within the `DynamoDbStack` class write/copy the following code:
+We then define a VPCLink for our API Gateway, attaching the NLB as the VPCLink target:
 
 ```typescript
-export class DynamoDbStack extends cdk.Stack {
-  public readonly table: dynamodb.Table;
-
-  constructor(scope: cdk.App, id: string, props: DynamoDbStackProps) {
-    ...
+const vpcLink = new apigateway.VpcLink(this, 'VPCLink', {
+  description: 'VPCLink for our  REST API',
+  vpcLinkName: 'MysfitsApiVpcLink',
+  targets: [
+    nlb
+  ]
+});
 ```
 
-Within the constructor write/copy the following code:
+Now, below the constructor, we will write one helper function to import an API specified in a swagger file.
 
 ```typescript
-this.table = new dynamodb.Table(this, "Table", {
-  tableName: "MysfitsTable",
-  partitionKey: {
-  name: "MysfitId",
-  type: dynamodb.AttributeType.STRING
+private generateSwaggerSpec(dnsName: string, userPoolId:string, vpcLink: apigateway.VpcLink): string {
+  try {
+    const schemaFilePath = path.resolve(__dirname + '/../../source/module-4/api/api-swagger.json');
+    const apiSchema = fs.readFileSync(schemaFilePath);
+    let schema: string = apiSchema.toString().replace(/REPLACE_ME_REGION/gi, cdk.Aws.REGION);
+    schema = schema.toString().replace(/REPLACE_ME_ACCOUNT_ID/gi, cdk.Aws.ACCOUNT_ID);
+    schema = schema.toString().replace(/REPLACE_ME_COGNITO_USER_POOL_ID/gi, userPoolId);
+    schema = schema.toString().replace(/REPLACE_ME_VPC_LINK_ID/gi, vpcLink.vpcLinkId);
+    schema = schema.toString().replace(/REPLACE_ME_NLB_DNS/gi, dnsName);
+    return schema;
+  } catch (exception) {
+    throw new Error('Failed to generate swagger specification.  Please refer to the Module 4 readme for instructions.');
   }
-});
-this.table.addGlobalSecondaryIndex({
-  indexName: "LawChaosIndex",
-  partitionKey: {
-  name: 'LawChaos',
-  type: dynamodb.AttributeType.STRING
-  },
-  sortKey: {
-  name: 'MysfitId',
-  type: dynamodb.AttributeType.STRING
-  },
-  readCapacity: 5,
-  writeCapacity: 5,
-  projectionType: dynamodb.ProjectionType.ALL
-});
-this.table.addGlobalSecondaryIndex({
-  indexName: "GoodEvilIndex",
-  partitionKey: {
-  name: 'GoodEvil',
-  type: dynamodb.AttributeType.STRING
-  },
-  sortKey: {
-  name: 'MysfitId',
-  type: dynamodb.AttributeType.STRING
-  },
-  readCapacity: 5,
-  writeCapacity: 5,
-  projectionType: dynamodb.ProjectionType.ALL
-});
-```
-
-Last but not least, we need to allow our ECS Cluster access to our DynamoDB by adding an IAM Role defining the permissions required:
-
-```typescript
-const fargatePolicy = new iam.PolicyStatement();
-fargatePolicy.addActions(
-  //  Allows the ECS tasks to interact with only the MysfitsTable in DynamoDB
-  "dynamodb:Scan",
-  "dynamodb:Query",
-  "dynamodb:UpdateItem",
-  "dynamodb:GetItem",
-  "dynamodb:DescribeTable"
-);
-fargatePolicy.addResources(
-  "arn:aws:dynamodb:*:*:table/MysfitsTable*"
-);
-props.fargateService.taskDefinition.addToTaskRolePolicy(
-  fargatePolicy
-);
-```
-
-With that done, now we want to deploy the DynamoDB table.  Make sure your CDK application compiles without error and deploy your application to your AWS account.
-
-```sh
-npm run build
-cdk deploy MythicalMysfits-ECS MythicalMysfits-DynamoDB
-```
-
-You will be prompted with a messages such as `Do you wish to deploy these changes (y/n)?` to which you should respond by typing `y`
-
-After the command runs, you can view the details of your newly created table by executing the following AWS CLI command in the terminal:
-
-```sh
-aws dynamodb describe-table --table-name MysfitsTable
-```
-
-If we execute the following command to retrieve all of the items stored in the table, you'll see that the table is empty:
-
-```sh
-aws dynamodb scan --table-name MysfitsTable
-```
-
-```json
-{
-    "Count": 0,
-    "Items": [],
-    "ScannedCount": 0,
-    "ConsumedCapacity": null
 }
 ```
 
-#### Add Items to the DynamoDB Table
+And finally, back within the constructor, we define our API Gateway utilising the helper function we just wrote:
 
-Also provided is a JSON file that can be used to batch insert a number of Mysfit items into this table.  This will be accomplished through the DynamoDB API **BatchWriteItem.** To call this API using the provided JSON file, execute the following terminal command (the response from the service should report that there are no items that went unprocessed):
+```typescript
+const schema = this.generateSwaggerSpec(props.loadBalancerDnsName, props.userPoolId, vpcLink);
+const jsonSchema = JSON.parse(schema);
+const api = new apigateway.CfnRestApi(this, 'Schema', {
+  name: 'MysfitsApi',
+  body: jsonSchema,
+  endpointConfiguration: {
+    types: [
+      apigateway.EndpointType.REGIONAL
+    ]
+  },
+  failOnWarnings: true
+});
 
+const prod = new apigateway.CfnDeployment(this, 'Prod', {
+    restApiId: api.ref,
+    stageName: 'prod'
+});
+
+new cdk.CfnOutput(this, 'APIID', {
+  value: api.ref,
+  description: 'API Gateway ID'
+})
 ```
-aws dynamodb batch-write-item --request-items file://~/environment/workshop/source/module-3/data/populate-dynamodb.json
-```
 
-Now, if you run the same command to scan all of the table contents, you'll find the items have been loaded into the table:
-
-```
-aws dynamodb scan --table-name MysfitsTable
-```
-
-### Committing The First *Real* Code change
-
-#### Copy the Updated Flask Service Code
-Now that we have our data included in the table, let's modify our application code to read from this table instead of returning the static JSON file that was used in Module 2.  We have included a new set of Python files for your Flask microservice, but now instead of reading the static JSON file will make a request to DynamoDB.
-
-The request is formed using the AWS Python SDK called **boto3**. This SDK is a powerful yet simple way to interact with AWS services via Python code. It enables you to use service client definitions and functions that have great symmetry with the AWS APIs and CLI commands you've already been executing as part of this workshop.  Translating those commands to working Python code is simple when using **boto3**.  To copy the new files into your CodeCommit repository directory, execute the following command in the terminal:
+Once you have finished, deploy your stack.
 
 ```sh
-cp ~/environment/workshop/source/module-3/app/service/* ~/environment/workshop/app/service/
+cdk deploy MythicalMysfits-APIGateway
 ```
 
-#### Push the Updated Code into the CI/CD Pipeline
+With that, our REST API that's capable of user authorization is deployed and available on the Internet... but where?!  Your API is available at the following location:
 
-Now, we need to check in these code changes to CodeCommit using the git command line client.  Run the following commands to check in the new code changes and kick of your CI/CD pipeline:
+```sh
+https://REPLACE_ME_WITH_API_ID.execute-api.REPLACE_ME_WITH_REGION.amazonaws.com/prod/mysfits
+```
+
+Copy the above, replacing the appropriate values, and enter it into a browser address bar. You should once again see your Mysfits JSON response.  But, we've added several capabilities like adopting and liking mysfits that our Flask backend doesn't have implemented yet.
+
+Let's take care of that next.
+
+### Updating the Mythical Mysfits Website
+
+#### Update the Flask Backend
+To accommodate the new functionality to view Mysfit Profiles, like, and adopt them, we have included updated Python code for your backend Flask web service.  Let's overwrite your existing codebase with these files and push them into the repository:
+
+```sh
+cp ~/environment/workshop/source/module-4/app/service/* ~/environment/workshop/app/service/
+```
 
 ```sh
 cd ~/environment/workshop/app
 git add .
-git commit -m "Add new integration to DynamoDB."
+git commit -m "Update service code backend to enable additional website features."
 git push
 ```
 
-Now, in just 5-10 minutes you'll see your code changes make it through your full CI/CD pipeline in CodePipeline and out to your deployed Flask service to AWS Fargate on Amazon ECS.  Feel free to explore the AWS CodePipeline console to see the changes progress through your pipeline.
+While those service updates are being automatically pushed through your CI/CD pipeline, continue on to the next step.
 
-#### Update The Website Content in S3
+#### Update the Mythical Mysfits Website in S3
 
-Finally, we need to publish a new website to our S3 bucket so that the new API functionality using query strings to filter responses will be used.  The new index.html file is located at `~/environment/workshop/source/module-3/web/index.html`. Copy this file to the `workshop/web` directory:
+The new version of the Mythical Mysfits website includes additional HTML and JavaScript code that is being used to add a user registration and login experience.  This code is interacting with the AWS Cognito JavaScript SDK to help manage registration, authentication, and authorization to all of the API calls that require it.
+
+The new version of the Mythical Mysfits website is located at `~/environment/workshop/source/module-4/web`. Copy the new version of the website to the `workshop/web` directory:
 
 ```sh
-cp -r ~/environment/workshop/source/module-3/web/* ~/environment/workshop/web
+cp -r ~/environment/workshop/source/module-4/web/* ~/environment/workshop/web
 ```
 
-Open the `~/environment/workshop/web/index.html` file in your Cloud9 IDE and replace the string indicating “REPLACE_ME” just as you did in Module 2, with the appropriate NLB endpoint. Remember do not inlcude the /mysfits path.
+Open the `~/environment/workshop/web/index.html` file in your Cloud9 IDE and replace the strings **REPLACE_ME** inside the single quotes with the values you copied from above and save the file:
 
-After replacing the endpoint to point at your NLB, update your S3 hosted website and deploy the `MythicalMysfits-Website` stack:
+![before-replace](/images/module-4/before-replace.png)
+
+> **Note:** The Cognito UserPool ID and the Cognito UserPool Client ID are the values you saved earlier on, e.g. `us-east-1_ab12345YZ` and  `6p3bs000no6a4ue1idruvd05ad` respectively. To retrieve the values of the API Gateway endpoint and AWS Region, you can use the following commands:
+
+```sh
+aws apigateway get-rest-apis --query 'items[?name==`MysfitsApi`][id]' --output text
+```
+
+```sh
+aws configure get region
+```
+
+Open the `~/environment/workshop/web/register.html` file in your Cloud9 IDE and replace the strings **REPLACE_ME** inside the single quotes with the Cognito UserPool ID and the Cognito UserPool Client ID values you copied from above and save the file. Repeat the same steps for the `~/environment/workshop/web/confirm.html` file.
+
+Now, let's update your S3 hosted website and deploy the `MythicalMysfits-Website` stack:
 
 ```sh
 cd ~/environment/workshop/cdk/
-npm run build
 cdk deploy MythicalMysfits-Website
 ```
 
-Re-visit your Mythical Mysfits website to see the new population of Mysfits loading from your DynamoDB table and how the Filter functionality is working!
+Refresh the Mythical Mysfits website in your browser to see the new functionality in action!
 
-That concludes module 3.
+This concludes Module 4.
 
-[Proceed to Module 4](/module-4)
+[Proceed to Module 5](/module-5)
 
 
 ## [AWS Developer Center](https://developer.aws)
