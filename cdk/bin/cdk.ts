@@ -11,6 +11,7 @@ import { CognitoStack } from '../lib/cognito-stack';
 import { DynamoDbStack } from '../lib/dynamodb-stack';
 import { APIGatewayStack } from "../lib/apigateway-stack";
 import { KinesisFirehoseStack } from "../lib/kinesis-firehose-stack";
+import { XRayStack } from "../lib/xray-stack";
 
 const app = new cdk.App();
 new WebApplicationStack(app, "MythicalMysfits-Website");
@@ -37,4 +38,5 @@ new APIGatewayStack(app, "MythicalMysfits-APIGateway", {
 new KinesisFirehoseStack(app, "MythicalMysfits-KinesisFirehose", {
     table: dynamoDbStack.table
 });
+new XRayStack(app, "MythicalMysfits-XRay");
 app.synth();

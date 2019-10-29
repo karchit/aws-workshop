@@ -33,7 +33,10 @@
     <div class="container">
         <div class='btn-toolbar float-right'>
           <button type="button" id="logInButton" class="btn btn-info btn-lg" data-toggle="modal" data-target="#loginModal">Log In / Register</button>
+          &nbsp;
           <button type="button" id="logOutButton" class="btn btn-danger btn-lg d-none">Log Out</button>
+          &nbsp;
+          <button type="button" id="askQuestionButton" class="btn btn-success btn-lg" data-toggle="modal" data-target="#questionModal">Contact Us</button>
         </div>
     </div>
     <div class="modal fade" id="loginModal" tabindex="-1" role="dialog" aria-hidden="true">
@@ -57,6 +60,33 @@
           <div class="login-help">
             <a href="register.html">Register</a>
           </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="modal fade" id="questionModal" tabindex="-1" role="dialog" aria-hidden="true">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <!-- Modal Header -->
+        <div class="modal-header">
+          <button type="button" class="close" data-dismiss="modal">
+            <span aria-hidden="true">&times;</span>
+            <span class="sr-only">Close</span>
+          </button>
+        </div>
+
+        <!-- Modal Body -->
+        <div class="modal-body">
+          <form id="questionForm">
+            <label for="questionModalEmail">Email Address:</label>
+            <input type="text" id ="questionModalEmail" name="questionModalEmail" placeholder="Email" />
+            <br>
+            <br>
+            <label for="questionModalQuestionText">Question/Comment:</label>
+            <textarea class="form-control" id="questionModalQuestionText" ></textarea>
+            <br>
+            <input type="submit" id="question-modal-button" name="questionButton" class="btn btn-info" value="Submit" />
+          </form>
         </div>
       </div>
     </div>
@@ -151,6 +181,7 @@
 
     var mysfitsApiEndpoint = 'REPLACE_ME'; // example: 'https://abcd12345.execute-api.us-east-1.amazonaws.com/prod'
     var streamingApiEndpoint = 'REPLACE_ME'; // example: 'https://abcd12345.execute-api.us-east-1.amazonaws.com/prod'
+    var questionsApiEndpoint = 'REPLACE_ME'; // example: 'https://abcd12345.execute-api.us-east-1.amazonaws.com/prod'
 
     var cognitoUserPoolId = 'REPLACE_ME';  // example: 'us-east-1_abcd12345'
     var cognitoUserPoolClientId = 'REPLACE_ME'; // example: 'abcd12345abcd12345abcd12345'
@@ -321,6 +352,14 @@
     $("#loginForm").submit(function(event) {
       event.preventDefault();
       loginUser();
+    });
+
+    $("#questionForm").submit(function(event) {
+      event.preventDefault();
+      $('#questionModal').modal('toggle')
+      var emailAddress = document.getElementById('questionModalEmail').value;
+      var questionText = document.getElementById('questionModalQuestionText').value;
+      submitQuestion(emailAddress, questionText );
     });
 
     app.controller('clearFilterController', function($scope) {
@@ -607,6 +646,37 @@
     });
 
   }
+
+  /* The new JavaScript function for module 6 that submits questions
+   * to the Mythical Mysfits administrator.
+   *
+   */
+   function submitQuestion(emailAddress, questionToSubmit) {
+
+    var questionsApi = questionsApiEndpoint + '/questions';
+    var question;
+
+
+    question = {
+      email: emailAddress,
+      questionText: questionToSubmit
+    }
+
+    $.ajax({
+      url : questionsApi,
+      type : 'POST',
+      headers : {'Content-Type': 'application/json'},
+      dataType: 'json',
+      data : JSON.stringify(question),
+      success : function(response) {
+        console.log("question submitted!")
+      },
+      error : function(response) {
+        console.log("could not submit question");
+        console.log(response);
+      }
+    });
+   }
 
   </script>
 </html>
