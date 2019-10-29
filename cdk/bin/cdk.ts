@@ -10,6 +10,7 @@ import { CiCdStack } from "../lib/cicd-stack";
 import { CognitoStack } from '../lib/cognito-stack';
 import { DynamoDbStack } from '../lib/dynamodb-stack';
 import { APIGatewayStack } from "../lib/apigateway-stack";
+import { KinesisFirehoseStack } from "../lib/kinesis-firehose-stack";
 
 const app = new cdk.App();
 new WebApplicationStack(app, "MythicalMysfits-Website");
@@ -33,5 +34,7 @@ new APIGatewayStack(app, "MythicalMysfits-APIGateway", {
   loadBalancerArn: ecsStack.ecsService.loadBalancer.loadBalancerArn,
   loadBalancerDnsName: ecsStack.ecsService.loadBalancer.loadBalancerDnsName
 });
-
+new KinesisFirehoseStack(app, "MythicalMysfits-KinesisFirehose", {
+    table: dynamoDbStack.table
+});
 app.synth();

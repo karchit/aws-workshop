@@ -1,222 +1,118 @@
-# Module 4: Adding User and API features with Amazon API Gateway and AWS Cognito
+# Module 5: Capturing User Behavior
 
-![Architecture](/images/module-4/architecture-module-4.png)
+![Architecture](/images/module-5/architecture-module-5.png)
 
-**Time to complete:** 60 minutes
+**Time to complete:** 30 minutes
 
 ---
-**Short of time?:** If you are short of time, refer to the completed reference AWS CDK code in `module-4/cdk`
+**Short of time?:** If you are short of time, refer to the completed reference AWS CDK code in `module-5/cdk`
 
 ---
 
 **Services used:**
-
-* [Amazon Cognito](http://aws.amazon.com/cognito/)
+* [AWS CloudFormation](https://aws.amazon.com/cloudformation/)
+* [AWS Kinesis Data Firehose](https://aws.amazon.com/kinesis/data-firehose/)
+* [Amazon S3](https://aws.amazon.com/s3/)
 * [Amazon API Gateway](https://aws.amazon.com/api-gateway/)
-* [Amazon Simple Storage Service (S3)](https://aws.amazon.com/s3/)
+* [AWS Lambda](https://aws.amazon.com/lambda/)
+* [AWS CodeCommit](https://aws.amazon.com/codecommit/)
 
-## Overview
+### Overview
+Now that your Mythical Mysfits site is up and running, let's create a way to better understand how users are interacting with the website and its Mysfits.  It would be very easy for us to analyze user actions taken on the website that lead to data changes in our backend - when mysfits are adopted or liked.  But understanding the actions your users are taking on the website *before* a decision to like or adopt a mysfit could help you design a better user experience in the future that leads to mysfits getting adopted even faster.  To help us gather these insights, we will implement the ability for the website frontend to submit a tiny request, each time a mysfit profile is clicked by a user, to a new microservice API we'll create. Those records will be processed in real-time by a serverless code function, aggregated, and stored for any future analysis that you may want to perform.
 
-In order to add some more critical aspects to the Mythical Mysfits website, like allowing users to vote for their favorite Mysfit and adopt a Mysfit, we need to first have users register on the website.  To enable registration and authentication of website users, we will create a [**User Pool**](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-identity-pools.html) in [**AWS Cognito**](http://aws.amazon.com/cognito/), a fully managed user identity management service.
+Modern application design principles prefer focused, decoupled, and modular services.  So rather than add additional methods and capabilities within the existing Mysfits service that you have been working with so far, we will create a new and decoupled service for the purpose of receiving user click events from the Mysfits website.
 
-We want to restrict liking and adopting Mysfits to registered users, so we'll need to restrict access to those paths in our Flask web app running on Fargate. Our Fargate service is currently using a Network Load Balancer (NLB), which doesn't support validating request authorization headers. To achieve this we have a few options: we can switch to an [Application Load Balancer](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html), we can have our Flask web app validate our authorization headers, or we can use [Amazon API Gateway](https://aws.amazon.com/api-gateway/).
+The serverless real-time processing service stack you will be creating includes the following AWS resources:
+* An [**AWS Kinesis Data Firehose delivery stream**](https://aws.amazon.com/kinesis/data-firehose/): Kinesis Firehose is a highly available and managed real-time streaming service that accepts data records and automatically ingests them into several possible storage destinations within AWS, examples including an Amazon S3 bucket, or an Amazon Redshift data warehouse cluster. Kinesis Firehose also enables all of the records received by the stream to be automatically delivered to a serverless function created with **AWS Lambda** This means that code you've written can perform any additional processing or transformations of the records before they are aggregated and stored in the configured destination.
+* An [**Amazon S3 bucket**](https://aws.amazon.com/s3/): A new bucket will be created in S3 where all of the processed click event records are aggregated into files and stored as objects.
+* An [**AWS Lambda function**](https://aws.amazon.com/lambda/): AWS Lambda enables developers to write code functions that only contain what their logic requires and have their code be deployed, invoked, made highly reliable, and scale without having to manage infrastructure whatsoever. Here, a Serverless code function is defined using AWS SAM. It will be deployed to AWS Lambda, written in Python, and then process and enrich the click records that are received by the delivery stream.  The code we've written is very simple and the enriching it does could have been accomplished on the website frontend without any subsequent processing  at all.  The function retrieves additional attributes about the clicked on Mysfit to make the click record more meaningful (data that was already retrieved by the website frontend).  But, for the purpose of this workshop, the code is meant to demonstrate the architectural possibilities of including a serverless code function to perform any additional processing or transformation required, in real-time, before records are stored.  Once the Lambda function is created and the Kinesis Firehose delivery stream is configured as an event source for the function, the delivery stream will automatically deliver click records as events to code function we've created, receive the responses that our code returns, and deliver the updated records to the configured Amazon S3 bucket.
+* An [**Amazon API Gateway REST API**](https://aws.amazon.com/api-gateway/): AWS Kinesis Firehose provides a service API just like other AWS services, and in this case we are using its PutRecord operation to put user click event records into the delivery stream. But, we don't want our website frontend to have to directly integrate with the Kinesis Firehose PutRecord API.  Doing so would require us to manage AWS credentials within our frontend code to authorize those API requests to the PutRecord API, and it would expose to users the direct AWS API that is being depended on (which may encourage malicious site visitors to attempt to add records to the delivery stream that are malformed, or harmful to our goal of understanding real user behavior).  So instead, we will use Amazon API Gateway to create an **AWS Service Proxy** to the PutRecord API of Kinesis Firehose.  This allows us to craft our own public RESTful endpoint that does not require AWS credential management on the frontend for requests. Also, we will use a request **mapping template** in API Gateway as well, which will let us define our own request payload structure that will restrict requests to our expected structure and then transform those well-formed requests into the structure that the Kinesis Firehose PutRecord API requires.
+* [**IAM Roles**](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles.html): Kinesis Firehose requires a service role that allows it to deliver received records as events to the created Lambda function as well as the processed records to the destination S3 bucket. The Amazon API Gateway API also requires a new role that permits the API to invoke the PutRecord API within Kinesis Firehose for each received API request.
 
-Amazon API Gateway provides commonly required REST API capabilities out of the box like SSL termination, CORS, request authorization, throttling, API stages and versioning, and much more. For these reasons, we'll choose to deploy an API Gateway in front of our NLB.
+Before we create the resources described above, we need to update and modify the Lambda function code it will deploy.
 
-Our API Gateway will provide HTTPS and CORS support, and also request authorization validation by integrating with our Cognito User Pool. We'll restrict access to authenicated users only on the `/adopt` and `/like` API endpoints
+### Create a new CodeCommit Repository
 
-API Gateway will then pass traffic through to our NLB to be processed by our Flask web app running on Fargate.
+This new stack you will deploy using the AWS Cloud Development Kit (CDK) will not only contain the infrastructure environment resources, but the application code itself that AWS Lambda will execute to process streaming events.  
 
-### Adding a User Pool for Website Users
-
-#### Create the Cognito User Pool
-
-To create the **Cognito User Pool** where all of the Mythical Mysfits visitors will be stored, create a new TypeScript file which we will use to define the Cognito stack.
-
-```sh
-cd ~/environment/workshop/cdk
-touch lib/cognito-stack.ts
-```
-
-Open the file `cognito-stack.ts` and define the following stack template:
-
-```typescript
-import cdk = require("@aws-cdk/core");
-
-export class CognitoStack extends cdk.Stack {
-
-  constructor(scope: cdk.Construct, id: string) {
-    super(scope, id);
-
-  }
-}
-```
-
-As we have done previously, we need to install the CDK NPM package for AWS Cognito:
-
-```sh
-npm install --save-dev @aws-cdk/aws-cognito
-```
-
-At the top of the file, add the import statement for the AWS Cognito cdk library
-
-```typescript
-import cognito = require("@aws-cdk/aws-cognito");
-```
-
-Just before the constructor statement, define the following public properties
-
-```typescript
-public readonly userPool: cognito.UserPool;
-public readonly userPoolClient: cognito.UserPoolClient;
-```
-
-Now, within the constructor _(after the `super(scope, id);` statement)_, define the Amazon Cognito UserPool
-
-```typescript
-this.userPool = new cognito.UserPool(this, 'UserPool', {
-  userPoolName: 'MysfitsUserPool',
-  autoVerifiedAttributes: [
-    cognito.UserPoolAttribute.EMAIL
-  ]
-});
-```
-
-This will create a Cognito UserPool and defines that all users who are registered with this pool should automatically have their email address verified via confirmation email before they become confirmed users.
-
-The last set we have to perform is to define a Amazon Cognito User Pool Client, which our web application will use.
-
-Again, within the constructor _(after the super(scope, id); statement)_, define the Amazon Cognito UserPool Client
-
-```typescript
-this.userPoolClient = new cognito.UserPoolClient(this, 'UserPoolClient', {
-  userPool: this.userPool,
-  userPoolClientName: 'MysfitsUserPoolClient'
-});
-```
-We can have the generated CloudFormation template provide the Cognito User Pool ID and the Cognito User Pool Client ID by defining custom output properties defining `cdk.CfnOutput` constructs. Declare `cdk.CfnOutput` both for the Cognito User Pool ID and the Cognito User Pool Client ID.
-
-```typescript
-new cdk.CfnOutput(this, "CognitoUserPool", {
-  description: "The Cognito User Pool",
-  value: this.userPool.userPoolId
-});
-
-new cdk.CfnOutput(this, "CognitoUserPoolClient", {
-  description: "The Cognito User Pool Client",
-  value: this.userPoolClient.userPoolClientId
-});
-```
-
-With that done, your `cognito_stack.ts` file should resemble the following.
-
-```typescript
-import cdk = require("@aws-cdk/core");
-import cognito = require("@aws-cdk/aws-cognito");
-
-export class CognitoStack extends cdk.Stack {
-  public readonly userPool: cognito.UserPool;
-  public readonly userPoolClient: cognito.UserPoolClient;
-
-  constructor(scope: cdk.Construct, id: string) {
-    super(scope, id);
-
-    this.userPool = new cognito.UserPool(this, 'UserPool', {
-      userPoolName: 'MysfitsUserPool',
-      autoVerifiedAttributes: [
-        cognito.UserPoolAttribute.EMAIL
-      ]
-    });
-
-    this.userPoolClient = new cognito.UserPoolClient(this, 'UserPoolClient', {
-      userPool: this.userPool,
-      userPoolClientName: 'MysfitsUserPoolClient'
-    });
-
-    new cdk.CfnOutput(this, "CognitoUserPool", {
-      description: "The Cognito User Pool",
-      value: this.userPool.userPoolId
-    });
-
-    new cdk.CfnOutput(this, "CognitoUserPoolClient", {
-      description: "The Cognito User Pool Client",
-      value: this.userPoolClient.userPoolClientId
-    });
-  }
-}
-```
-
-OK, That is our Amazon Cognito resources defined.  Now, let's add this to our `cdk.ts` bootstrap file.
-
-Import your new `CognitoStack` definition into the `cdk.ts` file by inserting the following `import` statement at the top of the file
-
-```typescript
-import { CognitoStack } from '../lib/cognito-stack';
-```
-
-Insert the following definition at the end your `cdk.ts` file.
-
-```typescript
-const cognito = new CognitoStack(app,  "MythicalMysfits-Cognito");
-```
-
-With that done, now we want to deploy the Cognito resources.  Make sure your CDK application compiles without error and deploy your application to your AWS account.
-
-```sh
-npm run build
-cdk deploy MythicalMysfits-Cognito
-```
-
-From the output of the previous command, note down the Cognito User Pool ID and the Cognito User Pool Client ID as we'll need these at a later step.
-
-### Adding a new REST API with Amazon API Gateway
-
-### Create an API Gateway VPC Link
-
-Next, let's turn our attention to creating a new RESTful API in front of our existing Flask service, so that we can perform request authorization before our NLB receives any requests.  We will do this with **Amazon API Gateway**, as described in the module overview.  In order for API Gateway to privately integrate with our NLB, we will configure an **API Gateway VPCLink** that enables API Gateway APIs to directly integrate with backend web services that are privately hosted inside a VPC.
-
-> **Note:** For the purposes of this workshop, we created the NLB to be *internet-facing* so that it could be called directly in earlier modules. Because of this, even though we will be requiring Authorization tokens in our API after this module, our NLB will still actually be open to the public behind the API Gateway API.  In a real-world scenario, you should create your NLB to be *internal* from the beginning (or create a new internal load balancer to replace the existing one), knowing that API Gateway would be your strategy for Internet-facing API authorization. But for the sake of time, we'll use the NLB that we've already created that will stay publicly accessible.
-
-#### Create the REST API using Swagger
-
-Your MythicalMysfits REST API is defined using **Swagger**, a popular open-source framework for describing APIs via JSON.  This Swagger definition of the API is located at `workshop/source/module-4/api/api-swagger.json`.  Open this file and you'll see the REST API and all of its resources, methods, and configuration defined within.
-
-The `securityDefinitions` object within the API definition indicates that we have setup an apiKey authorization mechanism using the Authorization header.  You will notice that AWS has provided custom extensions to Swagger using the prefix `x-amazon-api-gateway-`, these extensions are where API Gateway specific functionality can be added to typical Swagger files to take advantage of API Gateway-specific capabilities.
-
-To create the VPCLink and the API Gateway using the AWS CDK, create a new file in the `workshop/cdk/lib` folder called `apigateway-stack.ts`.
+To create the necessary resources using the AWS CDK, create a new file in the `workshop/cdk/lib` folder called `kinesis-firehose-stack.ts`.
 
 ```sh
 cd ~/environment/workshop/cdk
-touch lib/apigateway-stack.ts
+touch lib/kinesis-firehose-stack.ts
 ```
 
-Within the file you just created, define the skeleton CDK Stack structure as we have done before, this time naming the class `APIGatewayStack`:
+Within the file you just created, define the skeleton CDK Stack structure as we have done before, this time naming the class `KinesisFirehoseStack`:
 
 ```typescript
 import cdk = require('@aws-cdk/core');
 
-interface APIGatewayStackProps extends cdk.StackProps {
-  loadBalancerDnsName: string;
-  loadBalancerArn: string;
-  userPoolId: string;
-}
-
-export class APIGatewayStack extends cdk.Stack {
-  constructor(scope: cdk.Construct, id:string, props: APIGatewayStackProps) {
+export class KinesisFirehoseStack extends cdk.Stack {
+  constructor(scope: cdk.Construct, id:string) {
     super(scope, id);
-
     // The code that defines your stack goes here
   }
 }
 ```
 
-Then, add the APIGatewayStack to our CDK application definition in `bin/cdk.ts`, when done, your `bin/cdk.ts` should look like this;
+Install the AWS CDK npm package for Kinesis Firehose by executing the following command from within the `workshop/cdk/` directory:
+
+```sh
+npm install --save-dev @aws-cdk/aws-kinesisfirehose
+```
+
+Define the class imports for the code we will be writing:
+
+```typescript
+import cdk = require('@aws-cdk/core');
+import codecommit = require("@aws-cdk/aws-codecommit");
+import apigw = require("@aws-cdk/aws-apigateway");
+import iam = require("@aws-cdk/aws-iam");
+import dynamodb = require("@aws-cdk/aws-dynamodb");
+import { ServicePrincipal } from "@aws-cdk/aws-iam";
+import { CfnDeliveryStream } from "@aws-cdk/aws-kinesisfirehose";
+import lambda = require("@aws-cdk/aws-lambda");
+import s3 = require("@aws-cdk/aws-s3");
+```
+
+Define an interface that defines the properties our KinesisFirehoseStack will require:
+
+```typescript
+interface KinesisFirehoseStackProps extends cdk.StackProps {
+  table: dynamodb.Table;
+}
+```
+
+Now change the constructor of your KinesisFirehoseStack to require your properties object.
+
+```typescript
+  constructor(scope: cdk.Construct, id: string, props: KinesisFirehoseStackProps) {
+```
+
+Within the `KinesisFirehoseStack` constructor, add the CodeCommit repository we'll use for the Kinesis Firehose and Lambda code we will write:
+
+```typescript
+const lambdaRepository = new codecommit.Repository(this, "ClicksProcessingLambdaRepository", {
+  repositoryName: "MythicalMysfits-ClicksProcessingLambdaRepository"
+});
+
+new cdk.CfnOutput(this, "kinesisRepositoryCloneUrlHttp", {
+  value: lambdaRepository.repositoryCloneUrlHttp,
+  description: "Clicks Processing Lambda Repository Clone Url HTTP"
+});
+
+new cdk.CfnOutput(this, "kinesisRepositoryCloneUrlSsh", {
+  value: lambdaRepository.repositoryCloneUrlSsh,
+  description: "Clicks Processing Lambda Repository Clone Url SSH"
+});
+```
+
+Then, add the `KinesisFirehoseStack` to our CDK application definition in `bin/cdk.ts`, when done, your `bin/cdk.ts` file should look like this:
 
 ```typescript
 #!/usr/bin/env node
-
-import cdk = require("@aws-cdk/core");
 import 'source-map-support/register';
+import cdk = require('@aws-cdk/core');
 import { WebApplicationStack } from "../lib/web-application-stack";
 import { NetworkStack } from "../lib/network-stack";
 import { EcrStack } from "../lib/ecr-stack";
@@ -225,6 +121,7 @@ import { CiCdStack } from "../lib/cicd-stack";
 import { DynamoDbStack } from '../lib/dynamodb-stack';
 import { CognitoStack } from '../lib/cognito-stack';
 import { APIGatewayStack } from "../lib/apigateway-stack";
+import { KinesisFirehoseStack } from "../lib/kinesis-firehose-stack";
 
 const app = new cdk.App();
 new WebApplicationStack(app, "MythicalMysfits-Website");
@@ -248,162 +145,294 @@ new APIGatewayStack(app, "MythicalMysfits-APIGateway", {
   loadBalancerArn: ecsStack.ecsService.loadBalancer.loadBalancerArn,
   loadBalancerDnsName: ecsStack.ecsService.loadBalancer.loadBalancerDnsName
 });
-```
-
-Install the AWS CDK npm package for API Gateway by executing the following command from within the `workshop/cdk/` directory:
-
-```sh
-npm install --save-dev @aws-cdk/aws-apigateway
-```
-
-Back in `APIGatewayStack.ts`, define the class imports for the code we will be writing:
-
-```typescript
-import cdk = require('@aws-cdk/core');
-import apigateway = require('@aws-cdk/aws-apigateway');
-import elbv2 = require('@aws-cdk/aws-elasticloadbalancingv2');
-import fs = require('fs');
-import path = require('path');
-```
-
-Now, within the constructor of our `APIGatewayStack` class, let's import the Network Load Balancer from the ECS Cluster created in Module 2:
-
-```typescript
-const nlb = elbv2.NetworkLoadBalancer.fromNetworkLoadBalancerAttributes(this, 'NLB', {
-  loadBalancerArn: props.loadBalancerArn,
+new KinesisFirehoseStack(app, "MythicalMysfits-KinesisFirehose", {
+    table: dynamoDbStack.table
 });
 ```
 
-We then define a VPCLink for our API Gateway, attaching the NLB as the VPCLink target:
-
-```typescript
-const vpcLink = new apigateway.VpcLink(this, 'VPCLink', {
-  description: 'VPCLink for our  REST API',
-  vpcLinkName: 'MysfitsApiVpcLink',
-  targets: [
-    nlb
-  ]
-});
-```
-
-Now, below the constructor, we will write one helper function to import an API specified in a swagger file.
-
-```typescript
-private generateSwaggerSpec(dnsName: string, userPoolId:string, vpcLink: apigateway.VpcLink): string {
-  try {
-    const schemaFilePath = path.resolve(__dirname + '/../../source/module-4/api/api-swagger.json');
-    const apiSchema = fs.readFileSync(schemaFilePath);
-    let schema: string = apiSchema.toString().replace(/REPLACE_ME_REGION/gi, cdk.Aws.REGION);
-    schema = schema.toString().replace(/REPLACE_ME_ACCOUNT_ID/gi, cdk.Aws.ACCOUNT_ID);
-    schema = schema.toString().replace(/REPLACE_ME_COGNITO_USER_POOL_ID/gi, userPoolId);
-    schema = schema.toString().replace(/REPLACE_ME_VPC_LINK_ID/gi, vpcLink.vpcLinkId);
-    schema = schema.toString().replace(/REPLACE_ME_NLB_DNS/gi, dnsName);
-    return schema;
-  } catch (exception) {
-    throw new Error('Failed to generate swagger specification.  Please refer to the Module 4 readme for instructions.');
-  }
-}
-```
-
-And finally, back within the constructor, we define our API Gateway utilising the helper function we just wrote:
-
-```typescript
-const schema = this.generateSwaggerSpec(props.loadBalancerDnsName, props.userPoolId, vpcLink);
-const jsonSchema = JSON.parse(schema);
-const api = new apigateway.CfnRestApi(this, 'Schema', {
-  name: 'MysfitsApi',
-  body: jsonSchema,
-  endpointConfiguration: {
-    types: [
-      apigateway.EndpointType.REGIONAL
-    ]
-  },
-  failOnWarnings: true
-});
-
-const prod = new apigateway.CfnDeployment(this, 'Prod', {
-    restApiId: api.ref,
-    stageName: 'prod'
-});
-
-new cdk.CfnOutput(this, 'APIID', {
-  value: api.ref,
-  description: 'API Gateway ID'
-})
-```
-
-Once you have finished, deploy your stack.
+We are not yet finished writing the `KinesisFirehoseStack` implementation but let's deploy what we have written so far:
 
 ```sh
-cdk deploy MythicalMysfits-APIGateway
+cdk deploy MythicalMysfits-KinesisFirehose
 ```
 
-With that, our REST API that's capable of user authorization is deployed and available on the Internet... but where?!  Your API is available at the following location:
+In the output of that command, copy the value for `"Repository Clone Url HTTP"`.  It should be of the form: `https://git-codecommit.REPLACE_ME_REGION.amazonaws.com/v1/repos/MythicalMysfits-ClicksProcessingLambdaRepository`
+
+Next, let's clone that new and empty repository:
 
 ```sh
-https://REPLACE_ME_WITH_API_ID.execute-api.REPLACE_ME_WITH_REGION.amazonaws.com/prod/mysfits
+cd ~/environment/
+git clone REPLACE_ME_WITH_ABOVE_CLONE_URL lambda-streaming-processor
 ```
 
-Copy the above, replacing the appropriate values, and enter it into a browser address bar. You should once again see your Mysfits JSON response.  But, we've added several capabilities like adopting and liking mysfits that our Flask backend doesn't have implemented yet.
+### Copy the Streaming Service Code Base
 
-Let's take care of that next.
-
-### Updating the Mythical Mysfits Website
-
-#### Update the Flask Backend
-To accommodate the new functionality to view Mysfit Profiles, like, and adopt them, we have included updated Python code for your backend Flask web service.  Let's overwrite your existing codebase with these files and push them into the repository:
-
-```sh
-cp ~/environment/workshop/source/module-4/app/service/* ~/environment/workshop/app/service/
+Now, let's move our working directory into this new repository:
+```
+cd ~/environment/lambda-streaming-processor/
 ```
 
+Then, copy the module-5 application components into this new repository directory:
+```
+cp -r ~/environment/workshop/source/module-5/app/streaming/* .
+```
+
+### Update the Lambda Function Package and Code
+
+#### Use pip to Intall Lambda Function Dependencies
+If you look at the code inside the `streamProcessor.py` file, you'll notice that it's using the `requests` and `os` Python packages to make an API requset to the Mythical Mysfits service you created previously.  External libraries are not automatically included in the AWS Lambda runtime environment, because different AWS customers may depend on different versions of various libraries, etc.  You will need to package all of your library dependencies together with your Lambda code function prior to it being uploaded to the Lambda service.  We will use the Python package manager `pip` to accomplish this.  In the Cloud9 terminal, run the following command to install the required packages and their dependencies locally alongside your function code:
+
+```
+pip install requests -t .
+```
+
+Once this command completes, you will see several additional python package folders stored within your repository directory.  
+
+#### Push Your Code into CodeCommit
+Let's commit our code changes to the new repository so that they're saved in CodeCommit:
+
 ```sh
-cd ~/environment/workshop/app
 git add .
-git commit -m "Update service code backend to enable additional website features."
+git commit -m "New stream processing service."
 git push
 ```
 
-While those service updates are being automatically pushed through your CI/CD pipeline, continue on to the next step.
+### Creating the Streaming Service Stack
 
-#### Update the Mythical Mysfits Website in S3
-
-The new version of the Mythical Mysfits website includes additional HTML and JavaScript code that is being used to add a user registration and login experience.  This code is interacting with the AWS Cognito JavaScript SDK to help manage registration, authentication, and authorization to all of the API calls that require it.
-
-The new version of the Mythical Mysfits website is located at `~/environment/workshop/source/module-4/web`. Copy the new version of the website to the `workshop/web` directory:
+Change back into the `cdk` folder:
 
 ```sh
-cp -r ~/environment/workshop/source/module-4/web/* ~/environment/workshop/web
+cd ~/environment/workshop/cdk
 ```
 
-Open the `~/environment/workshop/web/index.html` file in your Cloud9 IDE and replace the strings **REPLACE_ME** inside the single quotes with the values you copied from above and save the file:
+Back in the `KinesisFirehoseStack` file,  we will now define the Kinesis Firehose infrastructure.  First, let's define the kinesis firehose implementation:
 
-![before-replace](/images/module-4/before-replace.png)
+```typescript
+const clicksDestinationBucket = new s3.Bucket(this, "Bucket", {
+  versioned: true
+});
 
-> **Note:** The Cognito UserPool ID and the Cognito UserPool Client ID are the values you saved earlier on, e.g. `us-east-1_ab12345YZ` and  `6p3bs000no6a4ue1idruvd05ad` respectively. To retrieve the values of the API Gateway endpoint and AWS Region, you can use the following commands:
+const lambdaFunctionPolicy =  new iam.PolicyStatement();
+lambdaFunctionPolicy.addActions("dynamodb:GetItem");
+lambdaFunctionPolicy.addResources(props.table.tableArn);
+
+const mysfitsClicksProcessor = new lambda.Function(this, "Function", {
+  handler: "streamProcessor.processRecord",
+  runtime: lambda.Runtime.PYTHON_3_6,
+  description: "An Amazon Kinesis Firehose stream processor that enriches click records" +
+    " to not just include a mysfitId, but also other attributes that can be analyzed later.",
+  memorySize: 128,
+  code: lambda.Code.asset("../../lambda-streaming-processor"),
+  timeout: cdk.Duration.seconds(30),
+  initialPolicy: [
+    lambdaFunctionPolicy
+  ],
+  environment: {
+    MYSFITS_API_URL: "REPLACE_ME_API_URL"
+  }
+});
+
+const firehoseDeliveryRole = new iam.Role(this, "FirehoseDeliveryRole", {
+  roleName: "FirehoseDeliveryRole",
+  assumedBy: new ServicePrincipal("firehose.amazonaws.com"),
+  externalId: cdk.Aws.ACCOUNT_ID
+});
+
+const firehoseDeliveryPolicyS3Stm = new iam.PolicyStatement();
+firehoseDeliveryPolicyS3Stm.addActions("s3:AbortMultipartUpload",
+      "s3:GetBucketLocation",
+      "s3:GetObject",
+      "s3:ListBucket",
+      "s3:ListBucketMultipartUploads",
+      "s3:PutObject");
+firehoseDeliveryPolicyS3Stm.addResources(clicksDestinationBucket.bucketArn);
+firehoseDeliveryPolicyS3Stm.addResources(clicksDestinationBucket.arnForObjects('*'));
+
+const firehoseDeliveryPolicyLambdaStm = new iam.PolicyStatement();
+firehoseDeliveryPolicyLambdaStm.addActions("lambda:InvokeFunction");
+firehoseDeliveryPolicyLambdaStm.addResources(mysfitsClicksProcessor.functionArn);
+
+firehoseDeliveryRole.addToPolicy(firehoseDeliveryPolicyS3Stm);
+firehoseDeliveryRole.addToPolicy(firehoseDeliveryPolicyLambdaStm);
+
+const mysfitsFireHoseToS3 = new CfnDeliveryStream(this, "DeliveryStream", {
+  extendedS3DestinationConfiguration: {
+    bucketArn: clicksDestinationBucket.bucketArn,
+    bufferingHints: {
+      intervalInSeconds: 60,
+      sizeInMBs: 50
+    },
+    compressionFormat: "UNCOMPRESSED",
+    prefix: "firehose/",
+    roleArn: firehoseDeliveryRole.roleArn,
+    processingConfiguration: {
+      enabled: true,
+      processors: [
+        {
+          parameters: [
+            {
+              parameterName: "LambdaArn",
+              parameterValue: mysfitsClicksProcessor.functionArn
+            }
+          ],
+          type: "Lambda"
+        }
+      ]
+    }
+  }
+});
+
+new lambda.CfnPermission(this, "Permission", {
+  action: "lambda:InvokeFunction",
+  functionName: mysfitsClicksProcessor.functionArn,
+  principal: "firehose.amazonaws.com",
+  sourceAccount: cdk.Aws.ACCOUNT_ID,
+  sourceArn: mysfitsFireHoseToS3.attrArn
+});
+
+const clickProcessingApiRole = new iam.Role(this, "ClickProcessingApiRole", {
+  assumedBy: new ServicePrincipal("apigateway.amazonaws.com")
+});
+
+const apiPolicy = new iam.PolicyStatement();
+apiPolicy.addActions("firehose:PutRecord");
+apiPolicy.addResources(mysfitsFireHoseToS3.attrArn);
+new iam.Policy(this, "ClickProcessingApiPolicy", {
+  policyName: "api_gateway_firehose_proxy_role",
+  statements: [
+    apiPolicy
+  ],
+  roles: [clickProcessingApiRole]
+});
+
+const api = new apigw.RestApi(this, "APIEndpoint", {
+    restApiName: "ClickProcessing API Service",
+    endpointTypes: [ apigw.EndpointType.REGIONAL ]
+});
+
+const clicks = api.root.addResource('clicks');
+
+clicks.addMethod('PUT', new apigw.AwsIntegration({
+    service: 'firehose',
+    integrationHttpMethod: 'POST',
+    action: 'PutRecord',
+    options: {
+        connectionType: apigw.ConnectionType.INTERNET,
+        credentialsRole: clickProcessingApiRole,
+        integrationResponses: [
+          {
+            statusCode: "200",
+            responseTemplates: {
+              "application/json": '{"status":"OK"}'
+            },
+            responseParameters: {
+              "method.response.header.Access-Control-Allow-Headers": "'Content-Type'",
+              "method.response.header.Access-Control-Allow-Methods": "'OPTIONS,PUT'",
+              "method.response.header.Access-Control-Allow-Origin": "'*'"
+            }
+          }
+        ],
+        requestParameters: {
+          "integration.request.header.Content-Type": "'application/x-amz-json-1.1'"
+        },
+        requestTemplates: {
+          "application/json": `{ "DeliveryStreamName": "${mysfitsFireHoseToS3.ref}", "Record": { "Data": "$util.base64Encode($input.json('$'))" }}`
+        }
+    }
+}), {
+    methodResponses: [
+      {
+        statusCode: "200",
+        responseParameters: {
+          "method.response.header.Access-Control-Allow-Headers": true,
+          "method.response.header.Access-Control-Allow-Methods": true,
+          "method.response.header.Access-Control-Allow-Origin": true
+        }
+      }
+    ]
+  }
+);
+
+clicks.addMethod("OPTIONS", new apigw.MockIntegration({
+  integrationResponses: [{
+    statusCode: "200",
+    responseParameters: {
+      "method.response.header.Access-Control-Allow-Headers":
+        "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Amz-User-Agent'",
+      "method.response.header.Access-Control-Allow-Origin": "'*'",
+      "method.response.header.Access-Control-Allow-Credentials":
+        "'false'",
+      "method.response.header.Access-Control-Allow-Methods":
+        "'OPTIONS,GET,PUT,POST,DELETE'"
+    }
+  }],
+  passthroughBehavior: apigw.PassthroughBehavior.NEVER,
+  requestTemplates: {
+    "application/json": '{"statusCode": 200}'
+  }
+}), {
+    methodResponses: [
+      {
+        statusCode: "200",
+        responseParameters: {
+          "method.response.header.Access-Control-Allow-Headers": true,
+          "method.response.header.Access-Control-Allow-Methods": true,
+          "method.response.header.Access-Control-Allow-Credentials": true,
+          "method.response.header.Access-Control-Allow-Origin": true
+        }
+      }
+    ]
+  }
+);
+```
+
+In the code we just wrote, there is a line that needs to be replaced with the ApiEndpoint for your Mysfits service API - the same service ApiEndpoint that you created in module-4 and used on the website frontend.  Be sure to update the your code.
+
+```typescript
+  ## Replace "REPLACE_ME_API_URL" with the ApiEndpoint for your Mysfits service API, eg: 'https://ljqomqjzbf.execute-api.us-east-1.amazonaws.com/prod/'
+  environment: {
+    MYSFITS_API_URL: "REPLACE_ME_API_URL"
+  }
+```
+
+That service is responsible for integrating with the MysfitsTable in DynamoDB, so even though we could write a Lambda function that directly integrated with the DynamoDB table as well, doing so would intrude upon the purpose of the first microservice and leave us with multiple/separate code bases that integrated with the same table.  Instead, we will integrate with that table through the existing service and have a much more decoupled and modular application architecture.
+
+Finally, deploy the CDK Application for the final time.
 
 ```sh
-aws apigateway get-rest-apis --query 'items[?name==`MysfitsApi`][id]' --output text
+cdk deploy MythicalMysfits-KinesisFirehose
 ```
+
+Note down the API Gateway endpoint, as we will need it in the next step.
+
+### Sending Mysfit Profile Clicks to the Service
+
+#### Update the Website Content and Push the New Site to S3
+With the streaming stack up and running, we now need to publish a new version of our Mythical Mysfits frontend that includes the JavaScript that sends events to our service whenever a mysfit profile is clicked by a user.
+
+The new index.html file is included at: `~/environment/workshop/source/module-5/web/index.html`. Copy the new version of the website to the `workshop/web` directory:
 
 ```sh
-aws configure get region
+cp -r ~/environment/workshop/source/module-5/web/* ~/environment/workshop/web
 ```
 
-Open the `~/environment/workshop/web/register.html` file in your Cloud9 IDE and replace the strings **REPLACE_ME** inside the single quotes with the Cognito UserPool ID and the Cognito UserPool Client ID values you copied from above and save the file. Repeat the same steps for the `~/environment/workshop/web/confirm.html` file.
+This file contains the same placeholders as module-4 that need to be updated, as well as an additional placeholder for the new stream processing service endpoint you just created. The `streamingApiEndpoint` value is the API Gateway endpoint you noted down earlier.
 
 Now, let's update your S3 hosted website and deploy the `MythicalMysfits-Website` stack:
 
 ```sh
-cd ~/environment/workshop/cdk/
+npm run build
 cdk deploy MythicalMysfits-Website
 ```
 
-Refresh the Mythical Mysfits website in your browser to see the new functionality in action!
+Refresh your Mythical Mysfits website in the browser once more and you will now have a site that records and publishes each time a user clicks on a mysfits profile!
 
-This concludes Module 4.
+To view the records that have been processed, they will arrive in the destination S3 bucket created as part of your MythicalMysfitsStreamingStack.  Visit the S3 console here and explore the bucket you created for the streaming records (it will be prefixed with `mythicalmysfits-kinesisfirehose-bucket...`):
+[Amazon S3 Console](https://s3.console.aws.amazon.com/s3/home)
 
-[Proceed to Module 5](/module-5)
+This concludes Module 5.
+
+### [Proceed to Module 6](/module-6)
 
 
-## [AWS Developer Center](https://developer.aws)
+#### [AWS Developer Center](https://developer.aws)
